@@ -6,12 +6,16 @@
 //   node update.mjs --set s2-api=done --note "s2-api=테스트 12개 통과" --log "서버 기능 뼈대 완료"
 //   node update.mjs --add "s3:s3-fix2:추가로 찾은 문제 고치기" --task "새 큰 작업 이름" --no-push
 // 상태 값: todo(대기) doing(진행 중) done(완료) wait(기다리는 중) skip(건너뜀)
+// --no-push 를 붙이면 커밋까지만 하고 올리지 않는다 (다음 갱신 때 함께 올라간다).
+// 이 저장소는 공개라서, 커밋하기 전에 옆 폴더의 비밀값 검사 도구로 올릴 내용을 살핀다.
+// 도구가 없거나 무엇인가 걸리면 커밋도 올리기도 하지 않고, 파일을 고치기 전으로 되돌린 뒤 실패로 끝난다.
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 const dir = import.meta.dirname;
 const file = path.join(dir, 'progress.json');
+const scanner = path.join(dir, '..', 'bangkkumi2', 'scripts', 'check-secrets.mjs');
 const lockDir = path.join(dir, '.update.lock');
 const STATES = new Set(['todo', 'doing', 'done', 'wait', 'skip']);
 
@@ -99,10 +103,35 @@ function git(args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function publish(summary) {
+// 커밋하려고 담아 둔 내용에 비밀값이 없는지 본다. 문제가 있으면 그 까닭을, 없으면 null을 돌려준다.
+function secretProblem() {
+  if (!fs.existsSync(scanner)) return '비밀값 검사 도구(../bangkkumi2/scripts/check-secrets.mjs)를 찾지 못했어요. 검사 없이는 커밋하지도 올리지도 않아요';
+  const result = spawnSync(process.execPath, [scanner, '--staged', dir], { encoding: 'utf8' });
+  if (result.status === 0) return null;
+  // 검사 도구는 값은 보여 주지 않고 어디에 무엇 종류가 있는지만 알려 준다
+  process.stderr.write(`${result.stdout ?? ''}${result.stderr ?? ''}`);
+  return '올리려는 글에 비밀값으로 보이는 것이 있어요. 그 글을 빼고 같은 명령을 다시 실행해 주세요';
+}
+
+function publish(summary, push, before) {
   git(['add', 'progress.json']);
   if (!git(['status', '--porcelain', 'progress.json']).trim()) return;
-  git(['commit', '-q', '-m', `진행 상황 갱신: ${summary}\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`]);
+  try {
+    const problem = secretProblem();
+    if (problem) throw new Error(problem);
+    try {
+      git(['commit', '-q', '-m', `진행 상황 갱신: ${summary}\n\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>`]);
+    } catch (error) {
+      // 실패한 명령줄에는 올리려던 글이 그대로 들어 있어서, git이 한 말만 전한다
+      throw new Error(`커밋하지 못했어요: ${String(error.stderr || '').trim() || '까닭을 알 수 없어요'}`);
+    }
+  } catch (error) {
+    // 커밋하지 못한 글이 파일에 남아 다음 갱신 때 함께 올라가지 않게, 고치기 전 내용으로 되돌린다
+    fs.writeFileSync(file, before);
+    git(['add', 'progress.json']);
+    throw error;
+  }
+  if (!push) return;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try { git(['push', '-q', 'origin', 'main']); return; } catch (error) {
       if (attempt === 3) { console.error(`올리지 못했어요(다음 갱신 때 함께 올라가요): ${String(error.stderr || error.message).trim()}`); return; }
@@ -114,13 +143,14 @@ function publish(summary) {
 try {
   const ops = parseArgs(process.argv.slice(2));
   withLock(() => {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const before = fs.readFileSync(file, 'utf8');
+    const data = JSON.parse(before);
     apply(data, ops);
     fs.writeFileSync(file, `${JSON.stringify(data, null, 2)}\n`);
     const summary = ops.log.at(-1) ?? ops.now ?? ops.set.map(([id, status]) => `${id} ${status}`).join(', ') ?? '내용 고침';
-    if (ops.push) publish(summary || '내용 고침');
+    publish(summary || '내용 고침', ops.push, before);
   });
-  if (!process.exitCode) console.log('진행 상황을 갱신했어요.');
+  if (!process.exitCode) console.log(ops.push ? '진행 상황을 갱신했어요.' : '진행 상황을 갱신했어요. (커밋까지만 하고 올리지는 않았어요)');
 } catch (error) {
   fail(error.message);
 }
